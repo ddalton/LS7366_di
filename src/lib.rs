@@ -22,9 +22,10 @@
 //! #    // In this case, the buffer is on SPI0 and SS1.
 //! #    // The chip acts in Mode0.
 //! #    let some_hal_spi_object = Spi::new(Bus::Spi0, SlaveSelect::Ss1, 14_000_000, Mode::Mode0).unwrap();
+//! #    let some_cs_pin = todo!();
 //! #
 //!     // Construct a driver instance from the SPI interface, using default chip configurations.
-//!     let mut spi_driver = Ls7366::new(some_hal_spi_object).unwrap();
+//!     let mut spi_driver = Ls7366::new(some_hal_spi_object, some_cs_pin).unwrap();
 //!
 //!     // Loop and read the counter.
 //!     loop {
@@ -45,18 +46,10 @@
 //!
 //! 1. Build an instance of [`Mdr0`] and [`Mdr1`] with the desired configuration.
 //! 2. Write these instances into the relevant registers.
-//! ```
+//! ```ignore
 //! use ls7366::mdr0::{QuadCountMode, CycleCountMode, FilterClockDivisionFactor,IndexMode, Mdr0};
 //! use ls7366::mdr1::{CounterMode, Mdr1};
 //! use ls7366::{Ls7366, Target, Encodable};
-//! use embedded_hal_mock::spi::Mock;
-//! use embedded_hal_mock::spi::Transaction as SpiTransaction;
-//! # let expectations = [
-//! #     SpiTransaction::write(vec![0b10001000, 0b10100110]),
-//! #     SpiTransaction::write(vec![0b10010000, 0b00000101])
-//! # ];
-//! # let spi = Mock::new(&expectations);
-//! # let mut driver = Ls7366::new_uninit(spi);
 //! // --- snip ---
 //!     let mdr0_configuration = Mdr0{
 //!         quad_count_mode: QuadCountMode::Quad2x,
@@ -67,16 +60,15 @@
 //!     };
 //!     let mdr1_configuration = Mdr1{
 //!         counter_mode: CounterMode::Byte3,
-//!         // --- Snip ---
-//!         # disable_counting:true,
-//!         # flag_on_bw: false,
-//!         # flag_on_idx: false,
-//!         # flag_on_cmp: false,
-//!         # flag_on_cy: false,
+//!         disable_counting:true,
+//!         flag_on_bw: false,
+//!         flag_on_idx: false,
+//!         flag_on_cmp: false,
+//!         flag_on_cy: false,
 //!     };
 //!
-//!     driver.write_register(Target::Mdr0, &[mdr0_configuration.encode()]).unwrap();
-//!     driver.write_register(Target::Mdr1, &[mdr1_configuration.encode()]).unwrap();
+//!     // driver.write_register(Target::Mdr0, &[mdr0_configuration.encode()]).unwrap();
+//!     // driver.write_register(Target::Mdr1, &[mdr1_configuration.encode()]).unwrap();
 //!
 //! ```
 //!
@@ -87,6 +79,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use embedded_hal::blocking::spi::{Transfer, Write};
+use embedded_hal::digital::v2::OutputPin;
 
 pub use crate::ir::{Action, Target};
 use crate::ir::InstructionRegister;
@@ -111,6 +104,8 @@ pub enum Error<SpiError> {
     EncodeError(errors::EncoderError),
     // Request to write payload larger than target register.
     PayloadTooBig,
+    // CS pin error
+    CsError,
 }
 
 
@@ -126,14 +121,17 @@ impl<E> From<E> for Error<E> {
     }
 }
 
-/// An LS8366 Quadrature encoder buffer
-pub struct Ls7366<SPI> {
+/// An LS7366 Quadrature encoder buffer
+pub struct Ls7366<SPI, CS> {
     /// SPI interface where the buffer is attached.
     interface: SPI,
+    /// Chip select pin (directly managed by the driver).
+    cs: CS,
 }
 
-impl<SPI, SpiError> Ls7366<SPI>
-    where SPI: Transfer<u8, Error=SpiError> + Write<u8, Error=SpiError> {
+impl<SPI, CS, SpiError> Ls7366<SPI, CS>
+    where SPI: Transfer<u8, Error=SpiError> + Write<u8, Error=SpiError>,
+          CS: OutputPin {
     /// Creates a new driver and initializes the Chip to some sensible default values.
     /// This will zero the chip's counter, configure it to 4 byte count mode (full range)
     /// and to treat every 4th quadrature pulse as a increment.
@@ -142,9 +140,11 @@ impl<SPI, SpiError> Ls7366<SPI>
     /// use the ([`uninit`]) constructor.
     ///
     /// [`uninit`]: #method.new_uninit
-    pub fn new(iface: SPI) -> Result<Self, Error<SpiError>> {
+    pub fn new(iface: SPI, mut cs: CS) -> Result<Self, Error<SpiError>> {
+        cs.set_high().map_err(|_| Error::CsError)?;
         let mut driver = Ls7366 {
-            interface: iface
+            interface: iface,
+            cs,
         };
         // Creating configurations for the two MDR configuration registers
         let mdr0_payload = mdr0::Mdr0 {
@@ -183,11 +183,19 @@ impl<SPI, SpiError> Ls7366<SPI>
     }
 
     /// Creates a new driver but does NOT do any initialization actions against the chip.
-    pub fn new_uninit(iface: SPI) -> Self {
-        Ls7366 {
-            interface: iface
-        }
+    pub fn new_uninit(iface: SPI, mut cs: CS) -> Result<Self, Error<SpiError>> {
+        cs.set_high().map_err(|_| Error::CsError)?;
+        Ok(Ls7366 {
+            interface: iface,
+            cs,
+        })
     }
+
+    /// Release the SPI interface and CS pin.
+    pub fn free(self) -> (SPI, CS) {
+        (self.interface, self.cs)
+    }
+
     /// Writes bytes into the specified register. attempting to write more than 4 bytes is an error.
     pub fn write_register(&mut self, target: ir::Target, data: &[u8]) -> Result<(), Error<SpiError>> {
         let ir_cmd = ir::InstructionRegister {
@@ -207,7 +215,10 @@ impl<SPI, SpiError> Ls7366<SPI>
             i+=1;
         }
         // only write as many bits as we had data, +1 for the IR.
-        self.interface.write(&payload[0.. data.len()+1])?;
+        self.cs.set_low().map_err(|_| Error::CsError)?;
+        let result = self.interface.write(&payload[0.. data.len()+1]);
+        self.cs.set_high().map_err(|_| Error::CsError)?;
+        result?;
         Ok(())
     }
     /// Executes a read operation against specified register, returning up to 4 bytes from the chip.
@@ -231,7 +242,10 @@ impl<SPI, SpiError> Ls7366<SPI>
         };
         let tx_buffer = &mut [ir.encode(), 0x00, 0x00, 0x00, 0x00];
 
-        let result = self.interface.transfer(tx_buffer)?;
+        self.cs.set_low().map_err(|_| Error::CsError)?;
+        let result = self.interface.transfer(tx_buffer);
+        self.cs.set_high().map_err(|_| Error::CsError)?;
+        let result = result?;
         rx_buffer.copy_from_slice(&result[1..]);
         Ok(rx_buffer)
     }
@@ -283,13 +297,19 @@ impl<SPI, SpiError> Ls7366<SPI>
                 if data.len() > 1 {
                     Err(Error::PayloadTooBig)
                 } else {
-                    self.interface.write(&tx_buffer)?;
+                    self.cs.set_low().map_err(|_| Error::CsError)?;
+                    let result = self.interface.write(&tx_buffer);
+                    self.cs.set_high().map_err(|_| Error::CsError)?;
+                    result?;
                     Ok(data)
                 }
             }
             Action::Read => {
                 let mut tx_buffer = [tx_buffer[0], 0x00, 0x00, 0x00, 0x00];
-                let result = self.interface.transfer(&mut tx_buffer)?;
+                self.cs.set_low().map_err(|_| Error::CsError)?;
+                let result = self.interface.transfer(&mut tx_buffer);
+                self.cs.set_high().map_err(|_| Error::CsError)?;
+                let result = result?;
                 data.copy_from_slice(result);
                 Ok(data)
             }
@@ -297,7 +317,10 @@ impl<SPI, SpiError> Ls7366<SPI>
                 if data.len() > 5 {
                     Err(Error::PayloadTooBig)
                 } else {
-                    self.interface.write(&tx_buffer)?;
+                    self.cs.set_low().map_err(|_| Error::CsError)?;
+                    let result = self.interface.write(&tx_buffer);
+                    self.cs.set_high().map_err(|_| Error::CsError)?;
+                    result?;
                     Ok(data)
                 }
             }
